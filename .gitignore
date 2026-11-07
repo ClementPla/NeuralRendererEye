@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+
+# training runs: only the ViT-S pupil model is versioned
+runs/*
+!runs/vit_s_pupil/
+runs/vit_s_pupil/*
+!runs/vit_s_pupil/best.pt
+!runs/vit_s_pupil/meta.json

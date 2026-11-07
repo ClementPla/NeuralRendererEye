@@ -1,0 +1,29 @@
+[project]
+name = "eyemodel3d"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "ClementPla",email = "clement.playout@polymtl.ca"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "torchvision",
+    "numpy",
+    "pillow",
+    "matplotlib",
+    "tqdm",
+    "timm",
+    "opencv-python",
+    "pandas",
+    "ipywidgets",
+]
+
+[tool.poetry]
+packages = [{include = "eyemodel3d", from = "src"}]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
