@@ -23,6 +23,24 @@ framing (the eye can then be wider than the image), limited so that the source i
 upsampled more than --max-upsample times. A zoom of an image is exactly a change of focal
 length (plus a principal-point shift), so f is predicted (log scale) and D is fixed.
 
+--anchor-range: where the iris centre lands in a zoomed window (fractions of its size);
+values beyond [0, 1] put the iris partly out of the frame, as in slit-lamp close-ups.
+--p-fov: limited field of view. The image is blacked out outside a random rectangle or
+disc around the iris (slit-lamp aperture, close-ups) while the mask target is KEPT
+everywhere: the network learns to complete the eye beyond what it sees.
+
+Zoom consistency (--unlabeled ROOT, interop layout ROOT/<dataset>/<image>): unlabeled
+photos give pairs of views of the same image: A in the standard framing (iris placed with
+the rough per-dataset positions of eyemodel3d.interop), B a random zoom/shift of it
+(iris anywhere in --anchor-range, strong augmentation, limited field of view). Both views
+come from the source pixels, so B is sharp. A zoom/shift is exactly a change of camera:
+    pB = z * pA + b   =>   f_B = z f_A,   cx_B = z cx_A + bx  (cx = W/2 + tx W, same in y)
+The network in eval mode (teacher, no gradient) predicts A; its parameters, with the
+camera moved to B, are rendered as a pseudo mask for B, and the network (student) is
+trained on B with the mask loss (and the teacher's laterality). Only samples with a
+confident teacher laterality are used (--cons-lat-conf). This teaches close-ups and
+off-centre framings on the photos of the target domains without annotations.
+
 Classes compared by the loss (TARGET_CLASSES): lid/skin (= everything that is not the
 eye: skin, brows, lid folds), sclera, iris (the model's iris + pupil are summed: the
 annotation has no pupil), caruncle. Edit LABEL_MAP for another label convention.
@@ -208,6 +226,35 @@ def strong_aug(x, img):
     return x.clamp(0, 1)
 
 
+def fov_aug(x, centre):
+    """Limited field of view: black outside a random rectangle or disc (slit-lamp aperture)
+    that contains `centre` = (x, y) in pixels (the iris centre). x: (3, H, W) in [0, 1]."""
+    _, H, W = x.shape
+    yy, xx = torch.meshgrid(
+        torch.arange(H, dtype=torch.float32) + 0.5,
+        torch.arange(W, dtype=torch.float32) + 0.5,
+        indexing="ij",
+    )
+    cx, cy = centre
+    if random.random() < 0.4:  # disc around the iris
+        r = random.uniform(0.3, 0.6) * max(H, W)
+        ox, oy = cx + random.uniform(-0.4, 0.4) * r, cy + random.uniform(-0.4, 0.4) * r
+        keep = (xx - ox) ** 2 + (yy - oy) ** 2 <= r * r
+    else:  # rectangle with the iris centre somewhere inside
+        w, h = random.uniform(0.35, 0.9) * W, random.uniform(0.35, 0.9) * H
+        x0, y0 = cx - random.uniform(0.1, 0.9) * w, cy - random.uniform(0.1, 0.9) * h
+        keep = (xx >= x0) & (xx < x0 + w) & (yy >= y0) & (yy < y0 + h)
+    return x * keep
+
+
+def label_centre(y):
+    """Iris centre (x, y) in pixels of a target label map, or the image centre."""
+    ys, xs = torch.nonzero((y == IRIS) | (y == PUPIL_T), as_tuple=True)
+    if len(xs) < 5:
+        return y.shape[1] / 2, y.shape[0] / 2
+    return xs.float().mean().item() + 0.5, ys.float().mean().item() + 0.5
+
+
 class EyeMaskDataset(torch.utils.data.Dataset):
     """Two samples per image: the image-left half (OD, medial +1) and the image-right half
     (OS, medial -1), each framed like a letterbox into H x W (padding is IGNORE).
@@ -229,10 +276,13 @@ class EyeMaskDataset(torch.utils.data.Dataset):
         seed=0,
         aug="basic",
         pupil=False,
+        anchor=(0.15, 0.85),
+        p_fov=0.0,
     ):
         self.pairs, self.H, self.W = pairs, H, W
         self.augment, self.zoom_eval, self.seed = augment, zoom_eval, seed
         self.strong = aug == "strong"
+        self.anchor, self.p_fov = tuple(anchor), p_fov
         self.p_zoom, self.zoom_max, self.max_upsample = p_zoom, zoom_max, max_upsample
         self.ramp = 1.0  # training curriculum: scales p_zoom and the zoom range (0..1)
         self.jitter = torchvision.transforms.ColorJitter(0.3, 0.3, 0.3, 0.03)
@@ -279,9 +329,10 @@ class EyeMaskDataset(torch.utils.data.Dataset):
         if len(xs) < 5:
             ys, xs = np.nonzero((m != 0) & (m != IGNORE))
         ax, ay = (xs.mean(), ys.mean()) if len(xs) else (w / 2, h / 2)
-        # the anchor (iris centre) lands at a random place in the central 70% of the window
-        x0 = ax - rng.uniform(0.15, 0.85) * ww
-        y0 = ay - rng.uniform(0.15, 0.85) * wh
+        # the anchor (iris centre) lands at a random place in the window (anchor range;
+        # beyond [0, 1] the iris is partly out of the frame)
+        x0 = ax - rng.uniform(*self.anchor) * ww
+        y0 = ay - rng.uniform(*self.anchor) * wh
         return _crop_resize(img, mask, (x0, y0, x0 + ww, y0 + wh), self.W, self.H)
 
     def __getitem__(self, i):
@@ -326,9 +377,81 @@ class EyeMaskDataset(torch.utils.data.Dataset):
         x = TF.to_tensor(img)
         if self.augment and self.strong:
             x = strong_aug(x, img)
-        x = (x - IMAGENET_MEAN) / IMAGENET_STD
         y = torch.from_numpy(np.array(mask, dtype=np.int64))
+        if self.augment and random.random() < self.p_fov:  # target kept everywhere
+            x = fov_aug(x, label_centre(y))
+        x = (x - IMAGENET_MEAN) / IMAGENET_STD
         return x, y, torch.tensor(medial), name
+
+
+class ConsistencyPairs(torch.utils.data.Dataset):
+    """Unlabeled photos (interop records) -> (xA, xB, rel): view A in the standard framing
+    (small scale/shift jitter, mild colour jitter), view B a random zoom of the source with
+    the iris centre at a random place (anchor range), strong augmentation and limited field
+    of view. rel = (z, bx, by): pixel coordinates satisfy pB = z * pA + (bx, by)."""
+
+    def __init__(self, records, H, W, zoom_max=3.0, max_upsample=4.0, anchor=(0.15, 0.85),
+                 p_fov=0.0, aug="strong"):
+        self.records, self.H, self.W = records, H, W
+        self.zoom_max, self.max_upsample = zoom_max, max_upsample
+        self.anchor, self.p_fov, self.strong = tuple(anchor), p_fov, aug == "strong"
+        self.jitter = torchvision.transforms.ColorJitter(0.3, 0.3, 0.3, 0.03)
+        self.weak = torchvision.transforms.ColorJitter(0.1, 0.1, 0.1, 0.0)
+
+    def __len__(self):
+        return len(self.records)
+
+    def warp(self, img, s, b):
+        """Output pixel p = s * source pixel + b (per axis), W x H, black outside."""
+        W0, H0 = img.size
+        r = min(1.0, s)  # downscale with antialiasing first, then upsample/shift exactly
+        if r < 1.0:
+            img = img.resize((max(1, round(W0 * r)), max(1, round(H0 * r))), Image.LANCZOS,
+                             reducing_gap=3.0)
+        rx, ry = img.size[0] / W0, img.size[1] / H0
+        # PIL: input = (a x + b y + c, d x + e y + f) for output (x, y)
+        coef = (rx / s, 0, -b[0] * rx / s, 0, ry / s, -b[1] * ry / s)
+        return img.transform((self.W, self.H), Image.AFFINE, coef, Image.BILINEAR,
+                             fillcolor=(0, 0, 0))
+
+    def __getitem__(self, i):
+        rec = self.records[i]
+        from .interop.core import TARGET_CENTER, TARGET_IRIS_W
+
+        img = Image.open(rec.path).convert("RGB")
+        W0, H0 = img.size
+        cx, cy, iw = rec.iris_cx * W0, rec.iris_cy * H0, rec.iris_w * W0
+        if random.random() < 0.5:
+            img, cx = img.transpose(Image.FLIP_LEFT_RIGHT), W0 - cx
+        H, W = self.H, self.W
+        u = random.uniform
+        sA = TARGET_IRIS_W * W / iw * math.exp(u(-0.15, 0.15))
+        bA = ((TARGET_CENTER[0] + u(-0.05, 0.05)) * W - sA * cx,
+              (TARGET_CENTER[1] + u(-0.05, 0.05)) * H - sA * cy)
+        zmax = min(self.zoom_max, max(1.0, self.max_upsample / sA))
+        z = math.exp(u(0, math.log(zmax)))
+        sB = z * sA
+        bB = (u(*self.anchor) * W - sB * cx, u(*self.anchor) * H - sB * cy)
+
+        a = self.weak(self.warp(img, sA, bA))
+        b = self.jitter(self.warp(img, sB, bB))
+        xA, xB = TF.to_tensor(a), TF.to_tensor(b)
+        if self.strong:
+            xB = strong_aug(xB, b)
+        if random.random() < self.p_fov:
+            xB = fov_aug(xB, (sB * cx + bB[0], sB * cy + bB[1]))
+        rel = torch.tensor([z, bB[0] - z * bA[0], bB[1] - z * bA[1]], dtype=torch.float32)
+        return (xA - IMAGENET_MEAN) / IMAGENET_STD, (xB - IMAGENET_MEAN) / IMAGENET_STD, rel
+
+
+def transfer_camera(vals, rel, H, W):
+    """Parameters predicted on view A -> the same eye seen in view B (pB = z pA + b)."""
+    z, bx, by = rel.unbind(1)
+    out = dict(vals)
+    out["f"] = vals["f"] * z
+    out["tx"] = (z * (W / 2 + vals["tx"] * W) + bx - W / 2) / W
+    out["ty"] = (z * (H / 2 + vals["ty"] * H) + by - H / 2) / H
+    return out
 
 
 # ----------------------------------------------------------------------------- model
@@ -546,6 +669,31 @@ def mixture_loss(vals, fixed, lat_logit, target, H, W, tau, args):
     return p_od * l_od + (1 - p_od) * l_os, probs
 
 
+def consistency_loss(net, space, fixed, xA, xB, rel, H, W, tau, args):
+    """Zoom consistency on unlabeled pairs (see the module docstring). Returns the mean
+    loss over samples with a confident teacher laterality, and their fraction."""
+    was_training = net.training
+    net.eval()
+    with torch.no_grad():
+        zA, latA = net(xA)
+        vB = transfer_camera(space.as_dict(space.values(zA)), rel, H, W)
+        mA = predicted_medial(latA, fixed)
+        probs, pp = render_batch(vB, fixed, mA, H, W, args.tau_min, pupil=True)
+        target = probs.argmax(-1)
+        if args.pupil:
+            target[(pp > 0.5) & (target == IRIS)] = PUPIL_T
+        conf = (torch.sigmoid(latA) - 0.5).abs() * 2 >= args.cons_lat_conf
+    net.train(was_training)
+    zB, latB = net(xB)
+    vals = space.as_dict(space.values(zB))
+    loss, _ = mixture_loss(vals, fixed, latB, target, H, W, tau, args)
+    loss = loss + args.w_lat * F.binary_cross_entropy_with_logits(
+        latB, (mA > 0).float(), reduction="none"
+    )
+    w = conf.float()
+    return (loss * w).sum() / w.sum().clamp(min=1), w.mean().item()
+
+
 def prior_loss(space, v):
     return ((space.normalize(v) - space.normalize(space.default)) ** 2).mean(1)
 
@@ -652,20 +800,51 @@ def train(args):
         f"parameters, input {net.net_input or (H, W)}, augmentation {args.aug}"
     )
     space.to(dev)
-    if args.init:  # backbone of a previous run (heads differ when the parameters differ)
-        sd = torch.load(args.init, map_location=dev, weights_only=False)["model"]
-        net.load_state_dict(
-            {k: v for k, v in sd.items() if k.startswith("backbone.")}, strict=False
-        )
-        print(f"backbone initialized from {args.init}")
+    if args.init:  # previous run: whole network if it predicts the same parameters
+        ck = torch.load(args.init, map_location=dev, weights_only=False)
+        sd, same = ck["model"], ck.get("meta", {}).get("names") == names
+        if not same:  # heads differ when the parameters differ
+            sd = {k: v for k, v in sd.items() if k.startswith("backbone.")}
+        net.load_state_dict(sd, strict=False)
+        print(f"{'network' if same else 'backbone'} initialized from {args.init}")
 
-    zkw = dict(p_zoom=args.p_zoom, zoom_max=args.zoom_max, max_upsample=args.max_upsample)
+    zkw = dict(
+        p_zoom=args.p_zoom,
+        zoom_max=args.zoom_max,
+        max_upsample=args.max_upsample,
+        anchor=tuple(args.anchor_range),
+    )
     kw = dict(
         batch_size=args.batch, num_workers=args.workers, pin_memory=dev.type == "cuda"
     )
     ds_tr = EyeMaskDataset(
-        train_pairs, H, W, augment=True, aug=args.aug, pupil=args.pupil, **zkw
+        train_pairs, H, W, augment=True, aug=args.aug, pupil=args.pupil, p_fov=args.p_fov,
+        **zkw
     )
+    unl_iter = None
+    if args.unlabeled:
+        if "f" not in names or "tx" not in names or "ty" not in names:
+            raise SystemExit("--unlabeled needs f, tx and ty predicted (not --fixed)")
+        from .interop.core import list_images, load_overrides
+
+        ov = load_overrides(args.unlabeled_overrides) if args.unlabeled_overrides else None
+        recs = list_images(args.unlabeled, args.unlabeled_datasets, ov)
+        ds_u = ConsistencyPairs(
+            recs, H, W, args.cons_zoom_max, args.max_upsample, args.anchor_range,
+            args.p_fov, args.aug,
+        )
+        dl_u = torch.utils.data.DataLoader(
+            ds_u, batch_size=args.cons_batch or args.batch, shuffle=True, drop_last=True,
+            num_workers=args.workers, pin_memory=dev.type == "cuda",
+            persistent_workers=args.workers > 0,
+        )
+
+        def cycle():
+            while True:
+                yield from dl_u
+
+        unl_iter = cycle()
+        print(f"zoom consistency on {len(recs)} unlabeled photos from {args.unlabeled}")
     dl_tr = torch.utils.data.DataLoader(
         ds_tr,
         shuffle=True,
@@ -718,6 +897,18 @@ def train(args):
         target_classes=TARGET_CLASSES,
         tau_min=args.tau_min,
         zoom=zkw,
+        p_fov=args.p_fov,
+        init=str(args.init) if args.init else None,
+        consistency=dict(
+            unlabeled=str(args.unlabeled),
+            datasets=args.unlabeled_datasets,
+            w=args.w_cons,
+            zoom_max=args.cons_zoom_max,
+            start=args.cons_start,
+            lat_conf=args.cons_lat_conf,
+        )
+        if args.unlabeled
+        else None,
     )
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -728,6 +919,11 @@ def train(args):
         ds_tr.ramp = min(1.0, ep / max(1.0, args.zoom_warmup * args.epochs))
         net.train()
         total, count = 0.0, 0
+        c_tot, c_conf, c_n = 0.0, 0.0, 0
+        # consistency weight: 0 before --cons-start (fraction of training), then ramps up
+        # linearly over 5 epochs
+        s0 = args.cons_start * args.epochs
+        w_cons = args.w_cons * min(1.0, max(0.0, (ep - s0 + 1) / 5)) if unl_iter else 0.0
         bar = tqdm(dl_tr, desc=f"epoch {ep}/{args.epochs}", leave=False)
         for x, y, med, _ in bar:
             x, y, med = x.to(dev), y.to(dev), med.to(dev)
@@ -740,6 +936,11 @@ def train(args):
                 + args.w_lat
                 * F.binary_cross_entropy_with_logits(lat_logit, (med > 0).float())
             )
+            if w_cons > 0:
+                xA, xB, rel = (t.to(dev, non_blocking=True) for t in next(unl_iter))
+                lc, frac = consistency_loss(net, space, fixed, xA, xB, rel, H, W, tau, args)
+                loss = loss + w_cons * lc
+                c_tot, c_conf, c_n = c_tot + lc.item(), c_conf + frac, c_n + 1
             opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), 5.0)
@@ -760,7 +961,13 @@ def train(args):
         print(
             f"epoch {ep:3d}  tau {tau:.3f}  zoom ramp {ds_tr.ramp:.2f}  train loss {total / max(count, 1):.4f}  "
             f"val Dice fg {fg:.4f} [{pc}]  zoomed {fg_z:.4f}  "
-            f"laterality acc {lat_acc:.3f} / zoomed {lat_acc_z:.3f}",
+            f"laterality acc {lat_acc:.3f} / zoomed {lat_acc_z:.3f}"
+            + (
+                f"  consistency {c_tot / c_n:.4f} (w {w_cons:.2f}, "
+                f"confident {c_conf / c_n:.2f})"
+                if c_n
+                else ""
+            ),
             flush=True,
         )
         score = (fg + fg_z) / 2
@@ -1101,6 +1308,47 @@ def main():
         "eyemodel3d.pupil) and predict r_pupil, dx, dy",
     )
     ap.add_argument("--w-pupil", type=float, default=1.0, help="pupil loss weight")
+    ap.add_argument(
+        "--anchor-range",
+        type=float,
+        nargs=2,
+        default=[0.15, 0.85],
+        metavar=("LO", "HI"),
+        help="where the iris centre lands in zoomed windows (fraction of the window); "
+        "e.g. -0.1 1.1 to also get irises cut by the frame",
+    )
+    ap.add_argument(
+        "--p-fov",
+        type=float,
+        default=0.0,
+        help="probability of a limited field of view (black outside a rectangle/disc "
+        "around the iris; target kept)",
+    )
+    ap.add_argument(
+        "--unlabeled",
+        help="interop-style folder (ROOT/<dataset>/<images>) for the zoom-consistency loss",
+    )
+    ap.add_argument("--unlabeled-datasets", nargs="*", help="subfolders to use (default: all)")
+    ap.add_argument(
+        "--unlabeled-overrides", help="interop overrides CSV (iris position/width per photo)"
+    )
+    ap.add_argument("--w-cons", type=float, default=0.5, help="zoom-consistency weight")
+    ap.add_argument(
+        "--cons-zoom-max", type=float, default=3.0, help="max zoom of view B vs view A"
+    )
+    ap.add_argument(
+        "--cons-start",
+        type=float,
+        default=0.2,
+        help="fraction of training before the consistency loss starts (0 with --init)",
+    )
+    ap.add_argument(
+        "--cons-lat-conf",
+        type=float,
+        default=0.6,
+        help="use pairs whose teacher laterality |2 p(OD) - 1| is at least this",
+    )
+    ap.add_argument("--cons-batch", type=int, help="unlabeled batch size (default: --batch)")
     ap.add_argument("--w-ce", type=float, default=1.0)
     ap.add_argument("--w-dice", type=float, default=1.0)
     ap.add_argument(
